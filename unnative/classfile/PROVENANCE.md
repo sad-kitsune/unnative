@@ -2,7 +2,7 @@
 
 **English** | [Русский](PROVENANCE.ru.md)
 
-These modules are **vendored from `unseed`** (`unseed.py`): its class-file parser
+These modules are **vendored from [`unseed`](https://github.com/sad-kitsune/unseed)** (`unseed.py`): its class-file parser
 and opcode table, copied rather than imported, so unnative has no dependency on
 unseed's layout and the two can evolve independently.
 
