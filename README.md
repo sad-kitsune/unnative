@@ -10,7 +10,7 @@ stub and ship the result as a bundled library that binds itself at load time. Th
 original bytecode is gone, so recovering what a method does means loading the native
 library, watching the JNI calls it makes, and lifting that back toward bytecode.
 `unnative` is a command-line pipeline for doing exactly that. Its class-file parser
-is shared with the sibling project `unseed`.
+is shared with the sibling project [unseed](https://github.com/sad-kitsune/unseed).
 
 ## What it does
 
