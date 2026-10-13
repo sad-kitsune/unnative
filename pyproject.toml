@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unnative"
+version = "0.0.1"
+description = "Recover readable Java from jars whose methods were translated to native code by JNIC or JVMTP."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "see LICENSE" }
+# The core (classfile parsing, triage, the driver) runs on the standard library
+# alone, so `python3 -m unnative` works with no install step. Heavier stages pull
+# optional extras, declared below rather than as hard requirements, so that triage
+# never fails to import because an emulator is missing.
+dependencies = []
+
+[project.optional-dependencies]
+# Phase 2/5: full emulation back-end (native/emu.py, native/jnienv.py).
+emu = ["unicorn>=2.0"]
+# Phase 0/4/6: static analysis of native libs via Ghidra headless.
+# pyghidra ships inside the Ghidra install; add it to PYTHONPATH rather than pip
+# where that is how your Ghidra exposes it. Listed here for documentation.
+ghidra = ["pyghidra"]
+dev = []
+
+[project.scripts]
+unnative = "unnative.cli:main"
+
+[tool.setuptools]
+packages = ["unnative", "unnative.classfile", "unnative.triage", "unnative.native",
+            "unnative.unpack"]
+
+[tool.setuptools.package-data]
+"unnative.classfile" = ["PROVENANCE.md", "PROVENANCE.ru.md"]

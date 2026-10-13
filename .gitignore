@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# unnative stage cache / per-sample work (large, reproducible)
+work/
+
+# corpus build outputs (reproducible from src + configs)
+corpus/build/
+corpus/out/
+
+# native tooling scratch
+*.so
+*.dll
+*.dylib
+*.class
+
+*.jar
+
+# local design notes / reconnaissance (not published)
+/plan.md
+/notes/
+
+# local sample material — analyse only jars you are authorised to analyse
+/sample.jar
+/sample-blobs/
+
+# editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
