@@ -87,8 +87,13 @@ class ExternShimTests(JavaFixtureCase):
     def test_memcpy_via_plt_is_serviced(self):
         # Without the extern shim this method's `call memcpy@plt` jumps through a
         # NULL GOT entry and faults; with it, memcpy runs and the method returns.
+        # -fno-builtin keeps gcc from inlining memcpy; disabling _FORTIFY_SOURCE
+        # (on by default on e.g. Ubuntu/CI toolchains) keeps string.h from
+        # rewriting the fixed-size memcpy into __memcpy_chk, so the PLT call is a
+        # plain `memcpy` on every distro.
         so = compile_shared(MEMCPY_C, self.tmp, "libcp.so", jni=True,
-                            flags=("-fno-builtin",))
+                            flags=("-fno-builtin", "-U_FORTIFY_SOURCE",
+                                   "-D_FORTIFY_SOURCE=0"))
         jar = self.build_jar(
             {"Demo.java": "public class Demo { public static native int cp(int x); }"},
             name="demo.jar")

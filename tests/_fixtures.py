@@ -172,8 +172,10 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 }
 """
 
-# Needs jni.h: a method that calls memcpy via the PLT (-fno-builtin prevents gcc
-# inlining it), exercising the emulator's extern/C-runtime shim.
+# Needs jni.h: a method that calls memcpy via the PLT (the caller compiles it with
+# -fno-builtin to stop gcc inlining it and with _FORTIFY_SOURCE off to stop the
+# string.h rewrite into __memcpy_chk), exercising the emulator's extern/C-runtime
+# shim.
 MEMCPY_C = """
 #include <jni.h>
 #include <string.h>
