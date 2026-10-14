@@ -14,8 +14,8 @@ Subcommands mirror the pipeline stages of plan.md §2:
     unnative emit    <jar>      Phase 7 — emit bytecode, rebuild the jar
     unnative verify  <jar>      Phase 8 — differential verification
 
-Only `triage` is implemented so far; the rest are honest stubs that report the
-phase that will build them (see plan.md §3).
+triage, unpack, bind, trace and lift are implemented; deobf, emit and verify are
+honest stubs that report the phase that will build them (see plan.md §3).
 """
 
 from __future__ import annotations
@@ -25,7 +25,9 @@ import os
 import sys
 
 from .bind import run_stage as bind_stage
+from .emit import run_stage as emit_stage
 from .errors import UnnativeError
+from .lift import run_stage as lift_stage
 from .trace import run_stage as trace_stage
 from .triage import run_stage as triage_stage
 from .unpack import run_stage as unpack_stage
@@ -60,18 +62,21 @@ def build_pipeline() -> Pipeline:
         Stage("trace", "Phase 5", trace_stage,
               inputs=["bindings.json", "libs"], outputs=["trace.json"],
               summary="dynamic JNI-call trace (behaviour per method)"),
+        # lift consumes the behaviour trace directly: the first slice is a linear
+        # idiom lifter that does not yet depend on the per-site deobf pass, so it
+        # runs here, before the still-stubbed deobf, and `run` reaches it.
+        Stage("lift", "Phase 6", lift_stage,
+              inputs=["trace.json", "bindings.json", "libs"], outputs=["jir"],
+              summary="lift native idioms to JVM-level IR"),
+        # emit consumes jir directly (like lift, no dependence on the per-site deobf
+        # pass), so it runs here before the still-stubbed deobf and `run` reaches it.
+        Stage("emit", "Phase 7", emit_stage,
+              inputs=["jir"], outputs=["rebuilt.jar"],
+              summary="emit bytecode, rebuild the jar"),
         Stage("deobf", "Phase 4",
               _stub("deobf", "Phase 4", "needs per-site concrete evaluation (Phase 5a)"),
               inputs=["bindings.json"], outputs=["deobf.json"],
               summary="recover strings / MBA constants / call targets / flatten"),
-        Stage("lift", "Phase 6",
-              _stub("lift", "Phase 6", "needs the JIR + per-protector idiom library"),
-              inputs=["deobf.json", "trace.json"], outputs=["jir"],
-              summary="lift native idioms to JVM-level IR"),
-        Stage("emit", "Phase 7",
-              _stub("emit", "Phase 7", "needs the Kotlin+ASM emitter"),
-              inputs=["jir"], outputs=["rebuilt.jar"],
-              summary="emit bytecode, rebuild the jar"),
         Stage("verify", "Phase 8",
               _stub("verify", "Phase 8", "needs the differential harness"),
               inputs=["rebuilt.jar"], outputs=["verify.json"],

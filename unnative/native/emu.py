@@ -49,9 +49,22 @@ class Invocation:
         return {
             "return_value": self.return_value,
             "fault": self.fault,
-            "jni_calls": [{"interface": e.interface, "fn": e.fn, "detail": e.detail}
-                          for e in self.trace],
+            "jni_calls": [self._event_json(e) for e in self.trace],
         }
+
+    @staticmethod
+    def _event_json(e) -> dict:
+        # Keep the record compact: the structured fields the lifter reads (ret /
+        # args / info) are emitted only when present, so ExceptionCheck-style events
+        # stay three keys wide while Call*/Get*ID events carry what Phase 6 needs.
+        d = {"interface": e.interface, "fn": e.fn, "detail": e.detail}
+        if e.result is not None:
+            d["ret"] = e.result
+        if e.args is not None:
+            d["args"] = e.args
+        if e.info is not None:
+            d["info"] = e.info
+        return d
 
 
 def _align_down(x: int) -> int:

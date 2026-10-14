@@ -18,6 +18,9 @@ dependencies = []
 [project.optional-dependencies]
 # Phase 2/5: full emulation back-end (native/emu.py, native/jnienv.py).
 emu = ["unicorn>=2.0"]
+# Phase 6: static control-flow recovery for the lifter (lift/cfg.py). Optional —
+# without it `lift` still emits the linear JIR, just no per-method CFG.
+cfg = ["capstone>=5.0"]
 # Phase 0/4/6: static analysis of native libs via Ghidra headless.
 # pyghidra ships inside the Ghidra install; add it to PYTHONPATH rather than pip
 # where that is how your Ghidra exposes it. Listed here for documentation.
@@ -29,7 +32,7 @@ unnative = "unnative.cli:main"
 
 [tool.setuptools]
 packages = ["unnative", "unnative.classfile", "unnative.triage", "unnative.native",
-            "unnative.unpack"]
+            "unnative.unpack", "unnative.lift"]
 
 [tool.setuptools.package-data]
 "unnative.classfile" = ["PROVENANCE.md", "PROVENANCE.ru.md"]

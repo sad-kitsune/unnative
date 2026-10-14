@@ -29,10 +29,32 @@ into a per-jar work directory, so results can be inspected and re-run independen
   `bindings.json`.
 - **trace** — run each bound method under the emulator and record the sequence of
   JNI calls it makes and its return value. Writes `trace.json`.
+- **lift** — recognise the JNI idioms in each trace (a `GetMethodID` + `Call*Method`
+  is an `invoke*`, `AllocObject` + `<init>` is `new`, a field access, a `throw`, …)
+  and emit a JVM-level IR. When capstone is installed, each method's IR is also
+  enriched with the control-flow graph recovered statically from its native code —
+  basic blocks, edges, loops, and any indirect jump left as an open exit. Writes a
+  `jir/` directory, one file per method, with a coverage summary. For the simplest
+  shapes — the reference-threaded straight-line methods such as `throw new X()` — it
+  also schedules the IR onto the operand stack and emits candidate bytecode; it
+  refuses, with a reason, any method that needs an operand it can't see (a computed
+  primitive, an untracked reference) or that isn't straight-line. It does not yet
+  recover the pure computation that makes no JNI call. Each gap is reported per
+  method rather than hidden, and emitted bytecode is candidate output until Phase 8
+  verifies it against the original.
+- **emit** — rebuild the jar from the lifted IR. For each method the lift stage
+  lowered to bytecode, fill the `native` stub: clear `ACC_NATIVE` and attach a real
+  `Code` attribute, written by a small pure-Python class-file writer (no external
+  toolchain — the straight-line methods lifted today need no StackMapTable). Methods
+  that didn't lift are left as native stubs and the loader is kept, so the rebuilt
+  jar still runs — partial recovery, not all-or-nothing. A signed jar has its
+  signature stripped, since rewriting a class invalidates it. Writes `rebuilt.jar`
+  and an `emit.json` summary. The filled methods pass the JVM's own `-Xverify:all`;
+  proving them *behaviourally* equal to the originals is Phase 8.
 
-Later stages — recovering obfuscated strings and constants, lifting the JNI-call
-streams back to bytecode, rebuilding the jar, and checking it against the original —
-are not implemented yet.
+Later stages — recovering obfuscated strings and constants (Phase 4), and
+differentially verifying the rebuilt jar against the original (Phase 8) — are not
+implemented yet.
 
 The emulator is a [Unicorn](https://www.unicorn-engine.org/) CPU with a synthetic
 `JNIEnv`/`JavaVM` and a small C-runtime shim, so the native library executes in a
@@ -44,6 +66,8 @@ sandbox that can't reach the host.
 - A JDK (17+) for the test fixtures and the sample corpus.
 - Unicorn, for the `bind`/`trace` emulation. The static `Java_*` binding path works
   without it.
+- capstone, for the `lift` stage's control-flow recovery. Without it `lift` still
+  emits the linear IR, minus the per-method CFG.
 
 ## Usage
 

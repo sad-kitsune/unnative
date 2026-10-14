@@ -140,6 +140,12 @@ class TraceEvent:
     fn: str
     detail: str
     result: object = None
+    # Structured fields for the lifter (Phase 6). `args` is the integer/handle
+    # argument vector (receiver excluded, as in JniCtx); `info` is whatever the
+    # handler already knew in structured form (a resolved class/member/string).
+    # Both are optional so events that need neither stay small.
+    args: "list[int] | None" = None
+    info: "dict | None" = None
 
 
 @dataclass
@@ -201,18 +207,24 @@ class JNIEnv:
             return self._default(interface, name, ctx)
         return handler(self, ctx)
 
-    def _record(self, interface: str, fn: str, detail: str, result: object = None):
-        self.trace.append(TraceEvent(interface, fn, detail, result))
+    def _record(self, interface: str, fn: str, detail: str, result: object = None,
+                args: "list[int] | None" = None, info: "dict | None" = None):
+        self.trace.append(TraceEvent(interface, fn, detail, result, args, info))
 
     def _default(self, interface: str, name: str, ctx: JniCtx) -> int | None:
         self.unimplemented.add(name)
         # Object/reference returns get a fresh non-null handle so callers can keep
         # going (and never call through a NULL); everything else gets 0.
+        # The consuming idioms (Call*Method, Get/SetField, AllocObject, NewObject,
+        # Throw*) all land here, so this is where the lifter reads its arguments:
+        # record the raw arg vector structurally, not just in the detail string.
         if _RET_BY_NAME.get(name) in _OBJECT_RETURNS:
             hid = self.handles.new("object", f"<{name}>")
-            self._record(interface, name, f"(unimplemented) args={ctx.args}", hid)
+            self._record(interface, name, f"(unimplemented) args={ctx.args}", hid,
+                         args=list(ctx.args))
             return hid
-        self._record(interface, name, f"(unimplemented) args={ctx.args}")
+        self._record(interface, name, f"(unimplemented) args={ctx.args}",
+                     args=list(ctx.args))
         return 0
 
     def _class_name_of(self, handle: int) -> str:
@@ -239,7 +251,8 @@ class JNIEnv:
         cm = self.model.find_class(name)
         hid = self.handles.new("class", name)
         self._record("JNIEnv", "FindClass",
-                     f"{name!r} ({'known' if cm else 'absent'})", hid)
+                     f"{name!r} ({'known' if cm else 'absent'})", hid,
+                     info={"class": name, "known": cm is not None})
         return hid
 
     @_handles("GetObjectClass")
@@ -248,7 +261,8 @@ class JNIEnv:
         desc = self.handles.descriptor(obj)
         name = desc if isinstance(desc, str) else "?"
         hid = self.handles.new("class", name)
-        self._record("JNIEnv", "GetObjectClass", f"obj#{obj:#x} -> {name}", hid)
+        self._record("JNIEnv", "GetObjectClass", f"obj#{obj:#x} -> {name}", hid,
+                     info={"class": name})
         return hid
 
     @_handles("GetSuperclass")
@@ -270,7 +284,9 @@ class JNIEnv:
         kind = "method" if is_method else "field"
         hid = self.handles.new(kind, ref if ref else (owner, name, sig))
         self._record("JNIEnv", fn,
-                     f"{owner}.{name}{sig} ({'resolved' if ref else 'unresolved'})", hid)
+                     f"{owner}.{name}{sig} ({'resolved' if ref else 'unresolved'})", hid,
+                     info={"member": kind, "owner": owner, "name": name, "desc": sig,
+                           "static": static, "resolved": ref is not None})
         return hid
 
     @_handles("GetMethodID")
@@ -296,7 +312,7 @@ class JNIEnv:
     def _new_string_utf(self, ctx: JniCtx):
         s = ctx.cstr(ctx.args[0])
         hid = self.handles.new("string", s)
-        self._record("JNIEnv", "NewStringUTF", f"{s!r}", hid)
+        self._record("JNIEnv", "NewStringUTF", f"{s!r}", hid, info={"string": s})
         return hid
 
     @_handles("GetStringUTFChars")
