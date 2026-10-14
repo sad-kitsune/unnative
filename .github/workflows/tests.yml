@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Fixtures are compiled on the fly with javac and the C compiler,
+      # so the runner needs a JDK alongside Python.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Optional extras bring in unicorn (emu tests) and capstone (lift CFG);
+      # without them those test groups skip themselves.
+      - name: Install package with optional extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[emu,cfg]'
+
+      - name: Run tests
+        run: python -m unittest discover -s tests
