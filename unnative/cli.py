@@ -29,6 +29,7 @@ from .emit import run_stage as emit_stage
 from .errors import UnnativeError
 from .lift import run_stage as lift_stage
 from .trace import run_stage as trace_stage
+from .verify import run_stage as verify_stage
 from .triage import run_stage as triage_stage
 from .unpack import run_stage as unpack_stage
 from .workdir import SOURCE, Pipeline, Stage, StageNotImplemented, WorkDir
@@ -68,19 +69,20 @@ def build_pipeline() -> Pipeline:
         Stage("lift", "Phase 6", lift_stage,
               inputs=["trace.json", "bindings.json", "libs"], outputs=["jir"],
               summary="lift native idioms to JVM-level IR"),
-        # emit consumes jir directly (like lift, no dependence on the per-site deobf
-        # pass), so it runs here before the still-stubbed deobf and `run` reaches it.
+        # emit and verify consume lift/emit outputs directly (no dependence on the
+        # per-site deobf pass), so they run here before the still-stubbed deobf and
+        # `run` reaches them.
         Stage("emit", "Phase 7", emit_stage,
               inputs=["jir"], outputs=["rebuilt.jar"],
               summary="emit bytecode, rebuild the jar"),
+        Stage("verify", "Phase 8", verify_stage,
+              inputs=["rebuilt.jar", "emit.json", "jir", "trace.json"],
+              outputs=["verify.json"],
+              summary="differential verification"),
         Stage("deobf", "Phase 4",
               _stub("deobf", "Phase 4", "needs per-site concrete evaluation (Phase 5a)"),
               inputs=["bindings.json"], outputs=["deobf.json"],
               summary="recover strings / MBA constants / call targets / flatten"),
-        Stage("verify", "Phase 8",
-              _stub("verify", "Phase 8", "needs the differential harness"),
-              inputs=["rebuilt.jar"], outputs=["verify.json"],
-              summary="differential verification"),
     ]
     return Pipeline(stages)
 

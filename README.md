@@ -49,11 +49,18 @@ into a per-jar work directory, so results can be inspected and re-run independen
   that didn't lift are left as native stubs and the loader is kept, so the rebuilt
   jar still runs — partial recovery, not all-or-nothing. A signed jar has its
   signature stripped, since rewriting a class invalidates it. Writes `rebuilt.jar`
-  and an `emit.json` summary. The filled methods pass the JVM's own `-Xverify:all`;
-  proving them *behaviourally* equal to the originals is Phase 8.
+  and an `emit.json` summary.
+- **verify** — differentially check the rebuilt methods. For each method `emit`
+  filled, compare the behaviour the lift stage recovered against two independent
+  witnesses: the bytecode re-decoded straight from `rebuilt.jar` (which catches any
+  emit-stage corruption) and the emulated original's JNI trace (ground truth, reached
+  by following the thrown object handle back to the class it came from). When a JDK
+  is present, each recovered body is also run on a real JVM and its outcome compared.
+  Writes `verify.json` with a per-method verdict. The honest limit: the original
+  native method can't be run in place — initialising its class triggers the
+  protector's loader — so the emulated trace is its only independent witness.
 
-Later stages — recovering obfuscated strings and constants (Phase 4), and
-differentially verifying the rebuilt jar against the original (Phase 8) — are not
+A later stage — recovering obfuscated strings and constants (Phase 4) — is not
 implemented yet.
 
 The emulator is a [Unicorn](https://www.unicorn-engine.org/) CPU with a synthetic
