@@ -29,19 +29,30 @@ into a per-jar work directory, so results can be inspected and re-run independen
   `bindings.json`.
 - **trace** — run each bound method under the emulator and record the sequence of
   JNI calls it makes and its return value. Writes `trace.json`.
+- **deobf** — recover MBA-hidden and opaque constants from the native code. For each
+  bound function it lifts the straight-line integer code of every basic block to an
+  expression over registers and folds it; a register that reads as runtime-dependent
+  but always collapses to one value is a hidden constant, and is recorded. The lift
+  is sound over complete — anything it can't model invalidates the registers that
+  instruction writes — so a recovered constant is real, not a guess. Writes
+  `deobf.json`. **Strings are out of scope here**: the caller-keyed Java string
+  encryption these jars use is recovered by the sibling tool
+  [unseed](https://github.com/sad-kitsune/unseed) (`unseed patch <jar>`), and
+  `unnative` deliberately doesn't reimplement it. Needs capstone, like `lift`.
 - **lift** — recognise the JNI idioms in each trace (a `GetMethodID` + `Call*Method`
   is an `invoke*`, `AllocObject` + `<init>` is `new`, a field access, a `throw`, …)
   and emit a JVM-level IR. When capstone is installed, each method's IR is also
   enriched with the control-flow graph recovered statically from its native code —
   basic blocks, edges, loops, and any indirect jump left as an open exit. Writes a
-  `jir/` directory, one file per method, with a coverage summary. For the simplest
-  shapes — the reference-threaded straight-line methods such as `throw new X()` — it
-  also schedules the IR onto the operand stack and emits candidate bytecode; it
-  refuses, with a reason, any method that needs an operand it can't see (a computed
-  primitive, an untracked reference) or that isn't straight-line. It does not yet
-  recover the pure computation that makes no JNI call. Each gap is reported per
-  method rather than hidden, and emitted bytecode is candidate output until Phase 8
-  verifies it against the original.
+  `jir/` directory, one file per method, with a coverage summary. For straight-line
+  methods whose operands are all tracked references or recovered constants — the
+  `throw new X()` family, and `obj.m(…)` / `System.out.println("…")` with the string
+  literals recovered from the trace — it schedules the IR onto the operand stack and
+  emits candidate bytecode; it refuses, with a reason, any method that needs a value
+  from native computation it can't yet see (a primitive, a method argument), a
+  multi-use value, or a branch. It does not yet recover the pure computation that
+  makes no JNI call. Each gap is reported per method rather than hidden, and emitted
+  bytecode is candidate output until Phase 8 verifies it against the original.
 - **emit** — rebuild the jar from the lifted IR. For each method the lift stage
   lowered to bytecode, fill the `native` stub: clear `ACC_NATIVE` and attach a real
   `Code` attribute, written by a small pure-Python class-file writer (no external
@@ -60,8 +71,10 @@ into a per-jar work directory, so results can be inspected and re-run independen
   native method can't be run in place — initialising its class triggers the
   protector's loader — so the emulated trace is its only independent witness.
 
-A later stage — recovering obfuscated strings and constants (Phase 4) — is not
-implemented yet.
+Every pipeline stage above is now implemented; several (`lift`, `emit`, `verify`,
+`deobf`) are first slices that cover specific shapes and report the rest honestly
+rather than guessing. JVMTP's per-build VM backend (plan.md Phase 9) is separate
+research — VM-backed methods are classified and left intact.
 
 The emulator is a [Unicorn](https://www.unicorn-engine.org/) CPU with a synthetic
 `JNIEnv`/`JavaVM` and a small C-runtime shim, so the native library executes in a

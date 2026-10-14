@@ -54,11 +54,12 @@ class FullPipelineTests(JavaFixtureCase):
         self.assertEqual(status["unpack"], "ran")
         self.assertEqual(status["bind"], "ran")
         self.assertEqual(status["trace"], "ran")
+        self.assertEqual(status["deobf"], "ran")           # scans the native fn (finds none)
         self.assertEqual(status["lift"], "ran")
         # compute() makes JNI calls but is not a stackifiable throw-shape, so emit
-        # has nothing to fill and stops cleanly here, before the stubbed deobf.
+        # has nothing to fill and stops cleanly here, before verify.
         self.assertEqual(status["emit"], "stopped")
-        self.assertNotIn("deobf", status)                  # pipeline stopped at emit
+        self.assertNotIn("verify", status)                 # pipeline stopped at emit
 
         with open(wd.path("bindings.json")) as f:
             bindings = json.load(f)

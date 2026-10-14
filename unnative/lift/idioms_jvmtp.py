@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 from . import jir
+from ..classfile import parse_desc
 
 # JNI type infixes in the Call*/Get*/Set* family names.
 _T = r"(?:Void|Object|Boolean|Byte|Char|Short|Int|Long|Float|Double)"
@@ -39,7 +40,7 @@ _NEW_PRIM_ARRAY = re.compile(rf"^New{_PRIM}Array$")
 # original loads/stores needs the native method body, not the call stream alone.
 # They are deferred (counted honestly), not treated as unknown.
 _DEFERRED = frozenset({
-    "NewString", "GetStringLength", "GetStringChars", "ReleaseStringChars",
+    "GetStringLength", "GetStringChars", "ReleaseStringChars",
     "GetStringUTFLength", "GetStringUTFChars", "ReleaseStringUTFChars",
     "GetStringRegion", "GetStringUTFRegion", "GetStringCritical", "ReleaseStringCritical",
     "GetPrimitiveArrayCritical", "ReleasePrimitiveArrayCritical",
@@ -133,12 +134,25 @@ def _has_params(desc: str) -> bool:
         return True                      # unknown shape: assume operands, stay safe
 
 
-def _ref_return(desc: str) -> bool:
-    r = desc[desc.index(")") + 1:] if ")" in desc else ""
-    return r[:1] in ("L", "[")
+_REF_RETURN = {"L", "["}
+
+# Int-category descriptors (ZBCSI): JVM stack category 1 ints, representable with
+# iconst/bipush/sipush/ldc-int. J (long) needs ldc2_w, F/D ride in XMM (untracked).
+_INT_CAT = frozenset({"Z", "B", "C", "S", "I"})
 
 
-def lift_method(method: str, jni_calls: list[dict], fault: str | None = None) -> jir.JirMethod:
+def lift_method(method: str, jni_calls: list[dict], fault: str | None = None,
+                locals: list[dict] | None = None,
+                call_sites: dict[int, dict[int, int]] | None = None) -> jir.JirMethod:
+    """Lift one method's JNI stream to JIR.
+
+    `call_sites` optionally maps the *unbiased vaddr* a JNI call was made from (the
+    trace's per-event `retaddr`) to {args_index: constant}: arg-index 2 is RCX, 3
+    is R8, 4 is R9 in the emulator's fixed-width arg array. When a primitive
+    operand equals the statically-proven constant at its call site, it threads as a
+    value-constant (`value_consts`) instead of staying opaque — the literal is
+    proven, never guessed.
+    """
     owner, name, desc = jir.split_method(method)
     m = jir.JirMethod(owner, name, desc, jni_calls=len(jni_calls), fault=fault)
     handles = _Handles()
@@ -156,9 +170,38 @@ def lift_method(method: str, jni_calls: list[dict], fault: str | None = None) ->
     def use_of(h) -> str | None:
         return vids.get(h)                # None => untracked operand (opaque)
 
+    # Statically-proven primitive constants: keyed per (call site, operand) so each
+    # proven literal is its own single-use value (stackify's single-use invariant).
+    consts: dict = {}
+
+    def const_use(c: dict, args_idx: int, value: int, ptype: str) -> str | None:
+        """vid of a *proven* constant operand, or None.
+
+        Proof is the static disassembly of the call site (`call_sites`), not the
+        raw traced argument: `call_sites[retaddr][args_idx] == value` means the
+        argument register held a literal at the call. Anything else stays opaque.
+        """
+        if not call_sites:
+            return None
+        site = call_sites.get(c.get("retaddr", 0))
+        if site is None or site.get(args_idx) != value:
+            return None
+        key = ("const", c.get("retaddr", 0), args_idx)
+        cv = consts.get(key)
+        if cv is None:
+            cv = vid(key)
+            consts[key] = cv
+            m.value_consts[cv] = {"value": value, "type": ptype}
+        return cv
+
     def emit(op: dict, defv: str | None = None, uses=(), opaque: bool = True):
         m.ops.append(op)
         m.dataflow.append({"def": defv, "uses": list(uses), "opaque": opaque})
+
+    # Seed the method's arguments as locals: a JNI operand equal to one of these
+    # distinctive values (recorded by the emulator) is a pure argument load.
+    for loc in (locals or []):
+        m.value_locals[vid(loc["value"])] = {"slot": loc["slot"], "type": loc["type"]}
 
     if not jni_calls:
         # No JNI traffic at all: the body is pure computation (arithmetic, local
@@ -190,9 +233,12 @@ def lift_method(method: str, jni_calls: list[dict], fault: str | None = None) ->
                               "static": info.get("static", False)})
             m.ignored += 1
             continue
-        if fn == "NewStringUTF" and info:
-            handles.set(ret, {"kind": "string", "value": info.get("string")})
-            m.ignored += 1
+        if fn in ("NewStringUTF", "NewString") and info is not None:
+            # The protector lowers `ldc "str"` to building the string natively. The
+            # emulator recovered the literal, so this is a threadable `ldc` value.
+            s = info.get("string")
+            handles.set(ret, {"kind": "string", "value": s})
+            emit(jir.op_ldc(s, "String"), defv=vid(ret), uses=(), opaque=s is None)
             continue
         if fn in _ALIAS:
             src = handles.get(args[0]) if args else None
@@ -218,11 +264,29 @@ def lift_method(method: str, jni_calls: list[dict], fault: str | None = None) ->
                     emit(jir.op_invoke(kind, ref["owner"], ref["name"], ref["desc"]),
                          uses=[recv], opaque=_has_params(ref["desc"]))
                 else:
-                    # The call's result, if a reference, becomes a tracked value; its
-                    # operands are not resolved yet, so the op itself stays opaque.
-                    defv = vid(ret) if ret is not None and _ref_return(ref["desc"]) else None
+                    # Thread the operands: the actual method arguments follow the
+                    # methodID handle, and the receiver (virtual/special only) is
+                    # args[0]. The op is threadable iff the receiver and every argument
+                    # are tracked values. A non-void result becomes a typed value
+                    # (stackify picks the load/return opcode from the descriptor). The
+                    # trace records a fixed-width arg array, so take exactly as many
+                    # argument slots as the descriptor declares (one per param).
+                    try:
+                        params = parse_desc(ref["desc"])[0]
+                    except Exception:
+                        params = []
+                    actual = args[mid_ix + 1: mid_ix + 1 + len(params)]
+                    uses = [] if kind == "static" else [recv]
+                    for i, a in enumerate(actual):
+                        u = use_of(a)
+                        if u is None and i < len(params) and params[i] in _INT_CAT:
+                            u = const_use(c, mid_ix + 1 + i, a, params[i])
+                        uses.append(u)
+                    ok = all(u is not None for u in uses)
+                    is_void = ref["desc"].endswith(")V")
+                    defv = vid(ret) if ret is not None and not is_void else None
                     emit(jir.op_invoke(kind, ref["owner"], ref["name"], ref["desc"]),
-                         defv=defv, opaque=True)
+                         defv=defv, uses=[u for u in uses if u is not None], opaque=not ok)
             else:
                 emit(jir.op_unlifted(fn, "unresolved methodID handle"))
                 m.unlifted += 1
@@ -232,11 +296,32 @@ def lift_method(method: str, jni_calls: list[dict], fault: str | None = None) ->
         if fop:
             ref = _member(handles, args[1]) if len(args) > 1 else None
             if ref:
-                # A field's desc is its type; a ref-typed getter yields a value.
-                is_ref_get = fop.startswith("get") and ref["desc"][:1] in ("L", "[")
-                defv = vid(ret) if ret is not None and is_ref_get else None
-                emit(jir.op_field(fop, ref["owner"], ref["name"], ref["desc"]),
-                     defv=defv, opaque=True)
+                # A field's desc is its type; the value threads whatever the type,
+                # and stackify emits the matching load/store/return opcode.
+                fa = (ref["owner"], ref["name"], ref["desc"])
+                if fop == "getstatic":                       # no receiver operand
+                    defv = vid(ret) if ret is not None else None
+                    emit(jir.op_field(fop, *fa), defv=defv, uses=(), opaque=False)
+                elif fop == "getfield":                      # Get*Field(obj, fieldID)
+                    recv = use_of(args[0]) if args else None
+                    defv = vid(ret) if ret is not None else None
+                    emit(jir.op_field(fop, *fa), defv=defv,
+                         uses=[recv] if recv is not None else (),
+                         opaque=recv is None)
+                elif fop == "putstatic":                     # SetStatic*Field(cls, fid, val)
+                    val = use_of(args[2]) if len(args) > 2 else None
+                    if val is None and len(args) > 2 and ref["desc"] in _INT_CAT:
+                        val = const_use(c, 2, args[2], ref["desc"])
+                    emit(jir.op_field(fop, *fa), uses=[val] if val is not None else (),
+                         opaque=val is None)
+                else:                                        # putfield: Set*Field(obj, fid, val)
+                    recv = use_of(args[0]) if args else None
+                    val = use_of(args[2]) if len(args) > 2 else None
+                    if val is None and len(args) > 2 and ref["desc"] in _INT_CAT:
+                        val = const_use(c, 2, args[2], ref["desc"])
+                    emit(jir.op_field(fop, *fa),
+                         uses=[u for u in (recv, val) if u is not None],
+                         opaque=recv is None or val is None)
             else:
                 emit(jir.op_unlifted(fn, "unresolved fieldID handle"))
                 m.unlifted += 1

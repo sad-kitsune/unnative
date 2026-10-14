@@ -37,10 +37,12 @@ _U2_MAX = 0xFFFF
 
 # -- constant-pool tags we append (JVMS Table 4.4-A) --
 _TAG_UTF8 = 1
+_TAG_INTEGER = 3
 _TAG_CLASS = 7
 _TAG_STRING = 8
 _TAG_FIELDREF = 9
 _TAG_METHODREF = 10
+_TAG_INTERFACEMETHODREF = 11
 _TAG_NAMEANDTYPE = 12
 
 
@@ -75,6 +77,19 @@ def _ret_slots(desc: str) -> int:
     if ret == "V":
         return 0
     return 2 if ret in ("J", "D") else 1
+
+
+def _type_slots(desc: str) -> int:
+    """Operand-stack slots a field of type `desc` occupies (2 for long/double)."""
+    return 2 if desc in ("J", "D") else 1
+
+
+# load mnemonic -> (general opcode, <op>_0 short-form base, stack slots pushed)
+_LOAD_OP = {"iload": (0x15, 0x1A, 1), "lload": (0x16, 0x1E, 2), "fload": (0x17, 0x22, 1),
+            "dload": (0x18, 0x26, 2), "aload": (0x19, 0x2A, 1)}
+# return mnemonic -> (opcode, stack slots popped)
+_RETURN_OP = {"ireturn": (0xAC, 1), "lreturn": (0xAD, 2), "freturn": (0xAE, 1),
+              "dreturn": (0xAF, 2), "areturn": (0xB0, 1)}
 
 
 @dataclass
@@ -185,9 +200,15 @@ class ClassWriter:
     def add_fieldref(self, owner: str, name: str, desc: str) -> int:
         return self._add_ref(_TAG_FIELDREF, "fieldref", owner, name, desc)
 
+    def add_interfacemethodref(self, owner: str, name: str, desc: str) -> int:
+        return self._add_ref(_TAG_INTERFACEMETHODREF, "ifmethodref", owner, name, desc)
+
     def add_string(self, s: str) -> int:
         utf8_i = self.add_utf8(s)
         return self._append(struct.pack(">BH", _TAG_STRING, utf8_i))
+
+    def add_int(self, value: int) -> int:
+        return self._append(struct.pack(">Bi", _TAG_INTEGER, value))
 
     # -- bytecode encoding -----------------------------------------------------
     def _encode(self, bytecode: list[dict]) -> tuple[bytes, int]:
@@ -217,10 +238,77 @@ class ClassWriter:
             elif bc == "athrow":
                 out.append(0xBF)
                 push_pop(1, 0)
+            elif bc == "checkcast":
+                out += struct.pack(">BH", 0xC0, self.add_class(op["owner"]))
+                push_pop(1, 1)                            # narrows the ref's type
+            elif bc == "return":
+                out.append(0xB1)
+            elif bc in _LOAD_OP:
+                gen, short, slots = _LOAD_OP[bc]
+                n = op["slot"]
+                if n <= 3:
+                    out.append(short + n)
+                elif n < 256:
+                    out += bytes([gen, n])
+                else:
+                    raise UnnativeError(f"emit: local slot {n} needs wide form (unsupported)")
+                push_pop(0, slots)
+            elif bc in _RETURN_OP:
+                opcode, slots = _RETURN_OP[bc]
+                out.append(opcode)
+                push_pop(slots, 0)
+            elif bc == "ldc":
+                ctype = op.get("ctype", "String")
+                if ctype == "String":
+                    out += struct.pack(">BH", 0x13, self.add_string(op["value"]))  # ldc_w
+                elif ctype == "I":
+                    v = op["value"]
+                    if -1 <= v <= 5:
+                        out.append(0x03 + v)                 # iconst_m1..iconst_5
+                    elif -128 <= v <= 127:
+                        out += bytes([0x10, v & 0xFF])       # bipush
+                    elif -32768 <= v <= 32767:
+                        out += struct.pack(">Bh", 0x11, v)   # sipush
+                    else:
+                        out += struct.pack(">BH", 0x13, self.add_int(v))  # ldc_w int
+                else:
+                    raise UnnativeError(f"emit: unsupported ldc type {ctype!r}")
+                push_pop(0, 1)
+            elif bc == "astore":
+                n = op["slot"]
+                if n <= 3:
+                    out.append(0x4B + n)                     # astore_0..astore_3
+                elif n < 256:
+                    out += bytes([0x3A, n])
+                else:
+                    raise UnnativeError(f"emit: local slot {n} needs wide form (unsupported)")
+                push_pop(1, 0)
+            elif bc == "getstatic":
+                out += struct.pack(">BH", 0xB2, self.add_fieldref(op["owner"], op["name"], op["desc"]))
+                push_pop(0, _type_slots(op["desc"]))
+            elif bc == "getfield":
+                out += struct.pack(">BH", 0xB4, self.add_fieldref(op["owner"], op["name"], op["desc"]))
+                push_pop(1, _type_slots(op["desc"]))
+            elif bc == "putstatic":
+                out += struct.pack(">BH", 0xB3, self.add_fieldref(op["owner"], op["name"], op["desc"]))
+                push_pop(_type_slots(op["desc"]), 0)
+            elif bc == "putfield":
+                out += struct.pack(">BH", 0xB5, self.add_fieldref(op["owner"], op["name"], op["desc"]))
+                push_pop(1 + _type_slots(op["desc"]), 0)
             elif bc == "invokespecial":
-                ref = self.add_methodref(op["owner"], op["name"], op["desc"])
-                out += struct.pack(">BH", 0xB7, ref)
+                out += struct.pack(">BH", 0xB7, self.add_methodref(op["owner"], op["name"], op["desc"]))
                 push_pop(1 + _arg_slots(op["desc"]), _ret_slots(op["desc"]))
+            elif bc == "invokevirtual":
+                out += struct.pack(">BH", 0xB6, self.add_methodref(op["owner"], op["name"], op["desc"]))
+                push_pop(1 + _arg_slots(op["desc"]), _ret_slots(op["desc"]))
+            elif bc == "invokestatic":
+                out += struct.pack(">BH", 0xB8, self.add_methodref(op["owner"], op["name"], op["desc"]))
+                push_pop(_arg_slots(op["desc"]), _ret_slots(op["desc"]))
+            elif bc == "invokeinterface":
+                ref = self.add_interfacemethodref(op["owner"], op["name"], op["desc"])
+                count = 1 + _arg_slots(op["desc"])
+                out += struct.pack(">BHBB", 0xB9, ref, count, 0)
+                push_pop(count, _ret_slots(op["desc"]))
             else:
                 raise UnnativeError(f"emit: unsupported bytecode op {bc!r}")
         return bytes(out), max_stack
@@ -247,7 +335,12 @@ class ClassWriter:
 
         code, max_stack = self._encode(bytecode)
         is_static = bool(m["access"] & ACC_STATIC)
-        max_locals = (0 if is_static else 1) + _arg_slots(desc)
+        arg_locals = (0 if is_static else 1) + _arg_slots(desc)
+        # A spill slot (multi-use construct stored to an extra local) can exceed the
+        # args: the verifier needs max_locals to cover every slot the code touches.
+        used = max((op["slot"] + (2 if op.get("bc") in ("lload", "dload", "lstore", "dstore")
+                                  else 1) for op in bytecode if "slot" in op), default=0)
+        max_locals = max(arg_locals, used)
         body = (struct.pack(">HHI", max_stack, max_locals, len(code)) + code
                 + struct.pack(">HH", 0, 0))          # empty exception table, no sub-attrs
         code_attr = struct.pack(">HI", self.add_utf8("Code"), len(body)) + body

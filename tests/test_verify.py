@@ -48,6 +48,10 @@ class DerivationTests(unittest.TestCase):
         self.assertEqual(diff.from_jir_ops(THROW_OPS), diff.Behaviour("throw", ERR))
         self.assertEqual(diff.from_jir_ops([]), diff.UNKNOWN)
 
+    def test_from_jir_ops_non_throw_is_return(self):
+        ops = [{"op": "field", "kind": "getstatic"}, {"op": "invoke", "kind": "virtual"}]
+        self.assertEqual(diff.from_jir_ops(ops), diff.Behaviour("return"))
+
     def test_from_trace_chases_handles(self):
         self.assertEqual(diff.from_trace(THROW_TRACE), diff.Behaviour("throw", ERR))
 
@@ -56,8 +60,10 @@ class DerivationTests(unittest.TestCase):
                  {"fn": "ThrowNew", "args": [5, 0]}]
         self.assertEqual(diff.from_trace(calls), diff.Behaviour("throw", ERR))
 
-    def test_from_trace_no_throw_is_unknown(self):
-        self.assertEqual(diff.from_trace([{"fn": "GetVersion", "ret": 8}]), diff.UNKNOWN)
+    def test_from_trace_no_throw_is_return(self):
+        # No Throw in the stream means the emulated method completed normally.
+        self.assertEqual(diff.from_trace([{"fn": "GetVersion", "ret": 8}]),
+                         diff.Behaviour("return"))
 
     def test_from_trace_multiple_refs_indeterminate_but_still_a_throw(self):
         # Throw of an object whose class can't be followed -> throw with no class.
@@ -85,6 +91,14 @@ class VerdictTests(unittest.TestCase):
     def test_unknown_recovered_is_unsupported(self):
         self.assertEqual(diff.verdict(diff.UNKNOWN, diff.UNKNOWN, diff.UNKNOWN)[0],
                          "unsupported")
+
+    def test_return_parity(self):
+        R = diff.Behaviour("return")
+        self.assertEqual(diff.verdict(R, R, R), ("parity", True))
+
+    def test_return_vs_throw_trace_is_mismatch(self):
+        R = diff.Behaviour("return")
+        self.assertEqual(diff.verdict(R, R, self.T)[0], "mismatch")
 
 
 class FromBytecodeTests(JavaFixtureCase):

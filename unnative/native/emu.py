@@ -17,7 +17,7 @@ than silently mis-decoding arguments.
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..classfile import parse_desc
 from ..errors import UnnativeError
@@ -35,6 +35,12 @@ JNI_REGION_SIZE = 0x4000
 HALT_ADDR = 0x5000_0000             # where a top-level call "returns" to
 EXTERN_BASE = 0x1_0002_0000         # sentinels for the library's external imports
 EXTERN_STEP = 16
+# Distinctive argument sentinels: a JNI-call operand equal to one marks a pure
+# method-argument load. Chosen to be implausible as a real computed int/long and
+# distinct per slot (added below). The int sentinel stays within 32 bits so it still
+# matches after a jint truncation.
+_INT_ARG_SENTINEL = 0xC0DE0000
+_LONG_ARG_SENTINEL = 0xC0DEC0DE_00000000
 
 
 @dataclass
@@ -44,13 +50,17 @@ class Invocation:
     return_value: int | None
     trace: list[TraceEvent]
     fault: str | None = None
+    locals: list = field(default_factory=list)      # method args as local slots
 
     def to_json(self) -> dict:
-        return {
+        d = {
             "return_value": self.return_value,
             "fault": self.fault,
             "jni_calls": [self._event_json(e) for e in self.trace],
         }
+        if self.locals:
+            d["locals"] = self.locals
+        return d
 
     @staticmethod
     def _event_json(e) -> dict:
@@ -64,6 +74,10 @@ class Invocation:
             d["args"] = e.args
         if e.info is not None:
             d["info"] = e.info
+        if e.retaddr:
+            # Unbiased call-site vaddr of this JNI call; lift uses it to prove
+            # which primitive arguments are compile-time constants.
+            d["retaddr"] = e.retaddr
         return d
 
 
@@ -102,8 +116,14 @@ class _UcCtx:
         rsp = uc.reg_read(x86.UC_X86_REG_RSP)
         # At the fetch fault RSP points at the pushed return address; further
         # integer args (7th+) would sit just above it.
-        stack = [struct.unpack("<Q", mem_read(rsp + 8 + 8 * i, 8))[0] for i in range(3)]
-        self.args = [rsi, rdx, rcx, r8, r9, *stack]
+        self.args = [rsi, rdx, rcx, r8, r9, *self._stack_args(mem_read, rsp)]
+        self.retaddr = struct.unpack("<Q", mem_read(rsp, 8))[0] if rsp else 0
+
+    @staticmethod
+    def _stack_args(mem_read, rsp):
+        if not rsp:
+            return []
+        return [struct.unpack("<Q", mem_read(rsp + 8 + 8 * i, 8))[0] for i in range(3)]
 
     def read(self, ptr: int, n: int) -> bytes:
         return bytes(self._mem_read(ptr, n))
@@ -269,12 +289,19 @@ class UnicornEmu:
                 return                  # padding byte in the trampoline region
             interface, name = slot
             ctx = _UcCtx(uc, x86, uc.mem_read, uc.mem_write)
+            start = len(self.env.trace)
             try:
                 result = self.env.dispatch(interface, name, ctx)
             except Exception as ex:                       # noqa: BLE001
                 self.fault = ("stub", name, str(ex))
                 uc.emu_stop()
                 return
+            # Stamp every event this dispatch recorded with the call site it was
+            # made from (unbiased vaddr). The lift stage matches this against the
+            # static disassembly to prove primitive arguments are constants.
+            callsite = (ctx.retaddr - self.load_bias) if ctx.retaddr else 0
+            for e in self.env.trace[start:]:
+                e.retaddr = callsite
             self._place_return(name, result)
             # Let the `ret` at this address execute to return to the caller.
 
@@ -434,18 +461,48 @@ class UnicornEmu:
                      timeout_us: int = 0, count: int = 0) -> "Invocation":
         """Invoke a bound native method and record the JNI-call stream it makes.
 
-        The receiver is a synthetic class handle (static) or object handle
-        (instance); arguments default to zero/null per the descriptor's arity.
-        Float/double arguments are not yet passed in XMM (a follow-up); methods that
-        take them are traced with those slots zeroed."""
+        Each argument is passed a *distinctive* value — the receiver and reference
+        arguments are labelled object handles, primitives are sentinels — and the
+        value→local-slot map is recorded on the Invocation. A JNI-call operand that
+        equals one of these is a pure argument load (`aload_1`/`iload_2`/…), which is
+        what lets the lifter thread a method's own parameters; a *computed* value
+        won't match a sentinel, so it stays honestly unrecovered.
+
+        Float/double arguments are not yet passed in XMM (a follow-up): those slots
+        are zeroed and get no local, so a method using them simply won't thread them.
+        `java_args` overrides the values (and disables the local map) for tests."""
         ref = self.model.resolve_method(owner, name, desc)
         static = ref.static if ref else True
-        nargs = len(parse_desc(desc)[0])
-        if java_args is None:
-            java_args = [0] * nargs
         receiver = self.new_class(owner) if static else self.new_object(owner)
-        int_args = [self.layout.env_struct, receiver, *java_args]
-        return self.invoke(vaddr, int_args, timeout_us=timeout_us, count=count)
+
+        locals_info: list[dict] = []
+        built: list[int] = []
+        slot = 0
+        if not static:
+            locals_info.append({"slot": 0, "value": receiver,
+                                "type": f"L{owner};", "name": "this"})
+            slot = 1
+        for p in parse_desc(desc)[0]:
+            if p in ("F", "D"):                          # not passed in regs yet
+                built.append(0)
+                slot += 2 if p == "D" else 1
+                continue
+            if p[0] in ("L", "["):
+                val = self.new_object(p[1:-1] if p.startswith("L") else p)
+                width = 1
+            else:
+                val = (_LONG_ARG_SENTINEL if p == "J" else _INT_ARG_SENTINEL) + slot
+                width = 2 if p == "J" else 1
+            built.append(val)
+            locals_info.append({"slot": slot, "value": val, "type": p})
+            slot += width
+
+        if java_args is not None:                        # explicit override (tests)
+            built, locals_info = java_args, []
+        inv = self.invoke(vaddr, [self.layout.env_struct, receiver, *built],
+                          timeout_us=timeout_us, count=count)
+        inv.locals = locals_info
+        return inv
 
     def _fault_message(self, ex) -> str:
         f = self.fault

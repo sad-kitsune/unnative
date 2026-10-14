@@ -35,9 +35,12 @@ UNKNOWN = Behaviour("unknown")
 
 def from_jir_ops(ops: list[dict]) -> Behaviour:
     """The behaviour the JIR models (the recovered expectation)."""
-    if ops and ops[-1].get("op") == "athrow" and ops[-1].get("class"):
-        return Behaviour("throw", ops[-1]["class"])
-    return UNKNOWN
+    if not ops:
+        return UNKNOWN
+    last = ops[-1]
+    if last.get("op") == "athrow":
+        return Behaviour("throw", last["class"]) if last.get("class") else UNKNOWN
+    return Behaviour("return")                       # completes normally
 
 
 def from_bytecode(insns: list, cf) -> Behaviour:
@@ -50,8 +53,12 @@ def from_bytecode(insns: list, cf) -> Behaviour:
     if names == ["new", "dup", "invokespecial", "athrow"]:
         cls = cf.class_name(insns[0].operands[0])
         owner, name, _desc, _kind = cf.ref(insns[2].operands[0])
-        if owner == cls and name == "<init>":
-            return Behaviour("throw", cls)
+        return Behaviour("throw", cls) if owner == cls and name == "<init>" else UNKNOWN
+    last = names[-1]
+    if last == "athrow":
+        return UNKNOWN                               # a throw shape we don't model
+    if last in ("return", "areturn", "ireturn", "lreturn", "freturn", "dreturn"):
+        return Behaviour("return")
     return UNKNOWN
 
 
@@ -63,7 +70,7 @@ def from_trace(jni_calls: list[dict]) -> Behaviour:
     `throw` with `exc=None` when it threw but the class can't be pinned down."""
     throws = [c for c in jni_calls if c.get("fn") in ("Throw", "ThrowNew")]
     if not throws:
-        return UNKNOWN
+        return Behaviour("return")                   # emulation completed without throwing
     by_ret = {c["ret"]: c for c in jni_calls if c.get("ret") is not None}
     t = throws[-1]
     args = t.get("args") or []
@@ -109,8 +116,13 @@ def verdict(recovered: Behaviour, rebuilt: Behaviour, trace: Behaviour) -> tuple
         return "unsupported", False
     if rebuilt != recovered:
         return "mismatch", False
-    if trace.kind == "throw" and recovered.kind == "throw":
+    if trace.kind == "unknown":
+        return "parity", False                          # trace couldn't confirm
+    if recovered.kind == "throw":
+        if trace.kind != "throw":
+            return "mismatch", False                    # emulation did not throw
         if trace.exc is None:
             return "parity", False                      # threw, class not pinned
         return ("parity", True) if trace.exc == recovered.exc else ("mismatch", False)
-    return "parity", False                              # trace couldn't confirm
+    # recovered completes normally
+    return ("parity", True) if trace.kind == "return" else ("mismatch", False)

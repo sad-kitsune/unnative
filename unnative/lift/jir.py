@@ -93,6 +93,15 @@ class JirMethod:
     # operands are not all tracked references (a computed primitive, an untracked
     # ref) — the signal that the method is not yet stackifiable. Conservatively True.
     dataflow: list[dict] = field(default_factory=list)
+    # vid -> {"slot": int, "type": descriptor} for values that are method arguments
+    # (incl. `this`): these materialise as local loads (aload_N/iload_N/…), can be
+    # loaded more than once, and are seeded from the trace's recorded argument slots.
+    value_locals: dict = field(default_factory=dict)
+    # vid -> {"value": int, "type": descriptor} for arguments the static proof
+    # showed are compile-time constants (a `mov $imm` immediates at the JNI call
+    # site, confirmed by the traced value). Materialise as ldc (iconst/bipush/…),
+    # re-materialisable like locals — a constant has no side effects to repeat.
+    value_consts: dict = field(default_factory=dict)
     # counts over the JNI calls this method was lifted from
     jni_calls: int = 0
     ignored: int = 0            # structural calls (ExceptionCheck, ref mgmt, …)
@@ -124,6 +133,8 @@ class JirMethod:
             "method": f"{self.owner}.{self.name}{self.desc}",
             "ops": self.ops,
             "dataflow": self.dataflow,
+            "locals": self.value_locals,
+            "consts": self.value_consts,
             "stats": {
                 "jni_calls": self.jni_calls,
                 "lifted": self.lifted,

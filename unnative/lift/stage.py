@@ -36,6 +36,27 @@ def _load_vaddr_map(bindings_path: str) -> dict[str, tuple[str, int]]:
     return out
 
 
+def _call_site_constants(md, reader, entry: int) -> dict[int, dict[int, int]]:
+    """{retaddr: {args_index: constant}} for every call in the function at `entry`.
+
+    Builds the function's CFG, disassembles each basic block, and lifts it block by
+    block (no cross-block guessing): wherever an argument register (RCX/R8/R9 =
+    args indices 2/3/4) provably holds a constant at a `call`, the value is recorded
+    against that call's return address. The lifter only accepts a primitive operand
+    that *equals* one of these — the literal is proven by the machine code, never
+    assumed from the traced number."""
+    from ..deobf import x86expr          # local: deobf imports lift.cfg, avoid a cycle
+    graph = cfgmod.build_cfg(reader, entry)
+    out: dict[int, dict[int, int]] = {}
+    for block in graph.blocks.values():
+        data = reader(block.start, block.end - block.start)
+        if not data:
+            continue
+        insns = list(md.disasm(data, block.start))
+        out.update(x86expr.call_site_constants(md, insns))
+    return out
+
+
 class _ElfCache:
     """Lazily load and reuse ElfImages by filename, with capstone-backed readers."""
 
@@ -83,19 +104,29 @@ def run_stage(wd: WorkDir) -> dict:
               "fully_lifted": 0, "pure_computation": 0, "faulted": 0,
               "with_cfg": 0, "cfg_with_loops": 0, "cfg_indirect_exits": 0,
               "cfg_truncated": 0, "stackified": 0}
+    md = None
+    if cfg_enabled:
+        import capstone
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = True
     for i, t in enumerate(trace.get("traces", [])):
         method = t["method"]
-        jm = idioms_jvmtp.lift_method(method, t.get("jni_calls", []), fault=t.get("fault"))
-        doc = jm.to_json()
-
+        call_sites = None
         cfg_json = None
         if cfg_enabled and method in vaddrs:
             lib, vaddr = vaddrs[method]
+            reader = elves.reader(lib)
             try:
-                graph = cfgmod.build_cfg(elves.reader(lib), vaddr)
+                graph = cfgmod.build_cfg(reader, vaddr)
                 cfg_json = graph.to_json()
+                sites = _call_site_constants(md, reader, vaddr)
+                call_sites = sites or None
             except Exception as ex:                   # a bad decode must not sink lift
                 cfg_json = {"error": f"{type(ex).__name__}: {ex}"}
+        jm = idioms_jvmtp.lift_method(method, t.get("jni_calls", []),
+                                      fault=t.get("fault"), locals=t.get("locals"),
+                                      call_sites=call_sites)
+        doc = jm.to_json()
         doc["cfg"] = cfg_json
 
         sk = stackifymod.stackify(jm)

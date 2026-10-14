@@ -22,11 +22,14 @@ from ..classfile import ClassFile
 from ..emit.writer import ClassWriter
 from ..errors import UnnativeError
 
+# The recovered method may itself print (e.g. a System.out.println body), so the
+# outcome is reported on its own sentinel line and parsed from that, not the raw tail.
+_SENTINEL = "@@UNNATIVE:"
 _HARNESS_SRC = """public class H {
     public static native void t();
     public static void main(String[] a) {
-        try { t(); System.out.println("RETURN"); }
-        catch (Throwable e) { System.out.println("THROW " + e.getClass().getName()); }
+        try { t(); System.out.println("\\n@@UNNATIVE:RETURN"); }
+        catch (Throwable e) { System.out.println("\\n@@UNNATIVE:THROW " + e.getClass().getName()); }
     }
 }
 """
@@ -65,13 +68,14 @@ def run_bytecode(bytecode: list[dict]) -> dict:
 
         run = subprocess.run(["java", "-Xverify:all", "-cp", tmp, "H"],
                              capture_output=True, text=True)
-        out = run.stdout.strip()
-        if out.startswith("THROW "):
-            name = out[len("THROW "):].strip().replace(".", "/")
-            return {"status": "ran", "behaviour": {"kind": "throw", "exc": name}}
-        if out == "RETURN":
+        verdict = next((ln[len(_SENTINEL):] for ln in reversed(run.stdout.splitlines())
+                        if ln.startswith(_SENTINEL)), None)
+        if verdict == "RETURN":
             return {"status": "ran", "behaviour": {"kind": "return", "exc": None}}
-        detail = (run.stderr.strip() or out)[:200]
+        if verdict and verdict.startswith("THROW "):
+            name = verdict[len("THROW "):].strip().replace(".", "/")
+            return {"status": "ran", "behaviour": {"kind": "throw", "exc": name}}
+        detail = (run.stderr.strip() or run.stdout.strip())[:200]
         return {"status": "error", "reason": f"harness did not run cleanly: {detail}"}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

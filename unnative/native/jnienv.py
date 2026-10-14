@@ -146,6 +146,10 @@ class TraceEvent:
     # Both are optional so events that need neither stay small.
     args: "list[int] | None" = None
     info: "dict | None" = None
+    # The guest-vaddr the native code was *called from* (the return address the
+    # `call` pushed). Stamped by the emulator after dispatch; it is how the lift
+    # stage matches a trace event to a static call site (Phase 6 constant proof).
+    retaddr: int = 0
 
 
 @dataclass
@@ -213,19 +217,28 @@ class JNIEnv:
 
     def _default(self, interface: str, name: str, ctx: JniCtx) -> int | None:
         self.unimplemented.add(name)
-        # Object/reference returns get a fresh non-null handle so callers can keep
-        # going (and never call through a NULL); everything else gets 0.
         # The consuming idioms (Call*Method, Get/SetField, AllocObject, NewObject,
         # Throw*) all land here, so this is where the lifter reads its arguments:
         # record the raw arg vector structurally, not just in the detail string.
-        if _RET_BY_NAME.get(name) in _OBJECT_RETURNS:
+        ret = _RET_BY_NAME.get(name)
+        if ret in _OBJECT_RETURNS:
+            # Object/reference returns get a fresh non-null handle so callers can keep
+            # going (and never call through a NULL).
             hid = self.handles.new("object", f"<{name}>")
-            self._record(interface, name, f"(unimplemented) args={ctx.args}", hid,
+        elif ret in ("void", None):
+            self._record(interface, name, f"(unimplemented) args={ctx.args}",
                          args=list(ctx.args))
-            return hid
-        self._record(interface, name, f"(unimplemented) args={ctx.args}",
+            return 0
+        else:
+            # A primitive return (jint/jlong/…) gets a distinctive, unique value too,
+            # so the lifter can thread it — a `GetIntField` whose result is returned
+            # (`int getX(){ return this.x; }`) or passed on. A computed primitive won't
+            # match it, so it stays unrecovered. The value is only an identity token;
+            # the rebuilt bytecode reads the real field/return at runtime.
+            hid = self.handles.new("primitive", f"<{name}>")
+        self._record(interface, name, f"(unimplemented) args={ctx.args}", hid,
                      args=list(ctx.args))
-        return 0
+        return hid
 
     def _class_name_of(self, handle: int) -> str:
         d = self.handles.descriptor(handle)
@@ -313,6 +326,23 @@ class JNIEnv:
         s = ctx.cstr(ctx.args[0])
         hid = self.handles.new("string", s)
         self._record("JNIEnv", "NewStringUTF", f"{s!r}", hid, info={"string": s})
+        return hid
+
+    @_handles("NewString")
+    def _new_string(self, ctx: JniCtx):
+        # NewString(env, const jchar* unicode, jsize len): UTF-16 code units in guest
+        # memory. Decoding it recovers the string literal behind an `ldc`, which is
+        # what a `System.out.println("…")`-style method needs to lift (not deferred).
+        ptr = ctx.args[0] if ctx.args else 0
+        n = ctx.args[1] if len(ctx.args) > 1 else 0
+        s = ""
+        if ptr and 0 <= n <= 1_000_000:
+            try:
+                s = ctx.read(ptr, 2 * n).decode("utf-16-le", "replace")
+            except Exception:                        # a bad pointer must not sink the trace
+                s = ""
+        hid = self.handles.new("string", s)
+        self._record("JNIEnv", "NewString", f"{s!r}", hid, info={"string": s})
         return hid
 
     @_handles("GetStringUTFChars")

@@ -117,6 +117,58 @@ class FieldIdiomTests(unittest.TestCase):
                                     "owner": "x/Y", "name": "s", "desc": "J"})
 
 
+class ConstThreadingTests(unittest.TestCase):
+    """Primitive arguments that the static proof (call_site_constants) shows are
+    immediates thread as value_consts; anything unproven stays opaque."""
+
+    def test_proven_int_args_thread_as_consts(self):
+        # AllocObject + CallVoidMethod setSize(300,300); the call site is proven
+        # in `call_sites` -> both args become value_consts, the invoke is non-opaque.
+        C = _find("FindClass", ret=1, info={"class": "x/Window", "known": True})
+        G = _find("NewGlobalRef", ret=2, args=[1])
+        O = _find("AllocObject", ret=3, args=[2])
+        M = _find("GetMethodID", ret=4, info={"member": "method", "owner": "x/Window",
+                  "name": "setSize", "desc": "(II)V", "static": False, "resolved": False})
+        call = {"fn": "CallVoidMethod", "args": [3, 4, 300, 300], "retaddr": 0x1000}
+        sites = {0x1000: {2: 300, 3: 300}}
+        m = idioms.lift_method("x/Y.f()V", [C, G, O, M, call], call_sites=sites)
+
+        self.assertEqual(len(m.ops), 2)                       # new + invoke
+        invoke = m.ops[-1]
+        self.assertEqual((invoke["name"], invoke["desc"]), ("setSize", "(II)V"))
+        df = m.dataflow[-1]
+        self.assertFalse(df["opaque"])
+        self.assertEqual(len(df["uses"]), 3)                  # receiver + two consts
+        self.assertEqual(len(m.value_consts), 2)
+        for v in df["uses"][1:]:
+            self.assertEqual(m.value_consts[v], {"value": 300, "type": "I"})
+
+    def test_unproven_int_arg_stays_opaque(self):
+        C = _find("FindClass", ret=1, info={"class": "x/Window", "known": True})
+        G = _find("NewGlobalRef", ret=2, args=[1])
+        O = _find("AllocObject", ret=3, args=[2])
+        M = _find("GetMethodID", ret=4, info={"member": "method", "owner": "x/Window",
+                  "name": "setSize", "desc": "(II)V", "static": False, "resolved": False})
+        call = {"fn": "CallVoidMethod", "args": [3, 4, 300, 300], "retaddr": 0x1000}
+        # No call_sites at all: a raw 300 in an operand slot is not a constant.
+        m = idioms.lift_method("x/Y.f()V", [C, G, O, M, call])
+        self.assertTrue(m.dataflow[-1]["opaque"])
+        self.assertEqual(m.value_consts, {})
+
+    def test_proven_putstatic_const(self):
+        C = _find("FindClass", ret=1, info={"class": "x/Window", "known": True})
+        F = _find("GetStaticFieldID", ret=2, info={"member": "field", "owner": "x/Window",
+                  "name": "width", "desc": "I", "static": True, "resolved": True})
+        call = {"fn": "SetStaticIntField", "args": [1, 2, 20], "retaddr": 0x2000}
+        m = idioms.lift_method("x/Y.f()V", [C, F, call],
+                               call_sites={0x2000: {2: 20}})
+        put = m.ops[0]
+        self.assertEqual((put["kind"], put["name"]), ("putstatic", "width"))
+        self.assertFalse(m.dataflow[0]["opaque"])
+        self.assertEqual(len(m.value_consts), 1)
+        self.assertEqual(list(m.value_consts.values())[0], {"value": 20, "type": "I"})
+
+
 class ArrayIdiomTests(unittest.TestCase):
     def test_length_and_new_and_region(self):
         calls = [

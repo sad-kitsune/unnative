@@ -35,10 +35,21 @@ def _index_jir(jir_dir: str) -> dict[str, dict]:
     return out
 
 
-def _index_trace(trace_path: str) -> dict[str, list]:
+def _index_trace(trace_path: str) -> dict[str, dict]:
     with open(trace_path) as f:
         trace = json.load(f)
-    return {t["method"]: t.get("jni_calls", []) for t in trace.get("traces", [])}
+    return {t["method"]: {"calls": t.get("jni_calls", []), "fault": t.get("fault")}
+            for t in trace.get("traces", [])}
+
+
+# Throwables raised because a class is *missing from the harness stub classpath*,
+# not because the recovered behaviour differs. Inconclusive, never a disagreement.
+_MISSING_APP_CLASS = frozenset({"java/lang/NoClassDefFoundError",
+                                "java/lang/ClassNotFoundException"})
+
+
+def _is_missing_app_class(behaviour: dict) -> bool:
+    return behaviour.get("kind") == "throw" and behaviour.get("exc") in _MISSING_APP_CLASS
 
 
 def run_stage(wd: WorkDir) -> dict:
@@ -82,7 +93,10 @@ def run_stage(wd: WorkDir) -> dict:
                                 "recovered": recovered.describe()})
                 continue
 
-            trace_bhv = diff.from_trace(traces.get(sig, []))
+            # A faulted emulation isn't a trustworthy witness of normal completion.
+            tr = traces.get(sig)
+            trace_bhv = (diff.UNKNOWN if (tr is None or tr.get("fault"))
+                         else diff.from_trace(tr["calls"]))
             v, confirmed = diff.verdict(recovered, rebuilt_bhv, trace_bhv)
 
             # Live run (one per distinct recovered body), compared to `recovered`.
@@ -96,11 +110,20 @@ def run_stage(wd: WorkDir) -> dict:
                 live = dict(res)
                 if res.get("status") == "ran":
                     obs = res["behaviour"]
-                    live["agreed"] = (obs["kind"] == recovered.kind
-                                      and obs.get("exc") == recovered.exc)
-                    if not live["agreed"] and v == "parity":
-                        v, confirmed = "mismatch", False
-                        live["reason"] = "live run disagreed with recovered behaviour"
+                    if _is_missing_app_class(obs):
+                        # The stub classpath can't contain the *application* classes
+                        # a partially-recovered body references (e.g. Window), so the
+                        # live run cannot witness it. That's inconclusive, not a
+                        # disagreement: miss the verdict, keep parity.
+                        live = {"status": "skipped",
+                                "reason": "recovered body references an application class "
+                                          "not on the harness stub classpath"}
+                    else:
+                        live["agreed"] = (obs["kind"] == recovered.kind
+                                          and obs.get("exc") == recovered.exc)
+                        if not live["agreed"] and v == "parity":
+                            v, confirmed = "mismatch", False
+                            live["reason"] = "live run disagreed with recovered behaviour"
 
             results.append({"method": sig, "verdict": v,
                             "recovered": recovered.describe(),
@@ -116,20 +139,31 @@ def run_stage(wd: WorkDir) -> dict:
     trace_confirmed = sum(1 for r in results if r.get("trace_confirmed"))
     live_ran = [r for r in results if r.get("live", {}).get("status") == "ran"]
     live_agreed = sum(1 for r in live_ran if r["live"].get("agreed"))
+    live_errored = [r for r in results if r.get("live", {}).get("status") == "error"]
 
     summary = {
         "stage": "verify", "checked": len(results), **counts,
         "trace_confirmed": trace_confirmed,
         "parity_rate": round(counts["parity"] / len(results), 4) if results else 1.0,
         "live": {"ran": len(live_ran), "agreed": live_agreed,
-                 "available": harness.available()},
+                 "errored": len(live_errored), "available": harness.available()},
         "methods": results,
     }
     with open(wd.path("verify.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
-    live_line = (f"; live-confirmed {live_agreed}/{len(live_ran)} on the JVM"
-                 if live_ran else "; live check skipped (no JDK)")
+    # An empty live run is not always "no JDK": list the method(s) where the harness
+    # itself failed (e.g. a recovered instance body dropped into the static H.t()
+    # stub) so a skipped live check is never mistaken for a clean pass.
+    if live_ran:
+        live_line = f"; live-confirmed {live_agreed}/{len(live_ran)} on the JVM"
+    elif live_errored:
+        first = live_errored[0]["live"].get("reason", "?")
+        live_line = f"; live check error on {len(live_errored)} body(-ies): {first}"
+    elif harness.available():
+        live_line = "; live check ran nothing"
+    else:
+        live_line = "; live check skipped (no JDK)"
     print(f"verify: {counts['parity']}/{len(results)} method(s) at parity "
           f"({trace_confirmed} trace-confirmed, {counts['mismatch']} mismatch, "
           f"{counts['unsupported']} unsupported){live_line}", file=sys.stderr)

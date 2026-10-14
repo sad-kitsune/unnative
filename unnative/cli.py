@@ -25,6 +25,7 @@ import os
 import sys
 
 from .bind import run_stage as bind_stage
+from .deobf import run_stage as deobf_stage
 from .emit import run_stage as emit_stage
 from .errors import UnnativeError
 from .lift import run_stage as lift_stage
@@ -32,15 +33,7 @@ from .trace import run_stage as trace_stage
 from .verify import run_stage as verify_stage
 from .triage import run_stage as triage_stage
 from .unpack import run_stage as unpack_stage
-from .workdir import SOURCE, Pipeline, Stage, StageNotImplemented, WorkDir
-
-
-def _stub(name: str, phase: str, note: str):
-    """A not-yet-implemented stage: raises StageNotImplemented so the driver can
-    stop cleanly and tell the user which plan.md phase owns the work."""
-    def fn(_wd: WorkDir):
-        raise StageNotImplemented(name, phase, note)
-    return fn
+from .workdir import SOURCE, Pipeline, Stage, WorkDir
 
 
 def build_pipeline() -> Pipeline:
@@ -63,15 +56,12 @@ def build_pipeline() -> Pipeline:
         Stage("trace", "Phase 5", trace_stage,
               inputs=["bindings.json", "libs"], outputs=["trace.json"],
               summary="dynamic JNI-call trace (behaviour per method)"),
-        # lift consumes the behaviour trace directly: the first slice is a linear
-        # idiom lifter that does not yet depend on the per-site deobf pass, so it
-        # runs here, before the still-stubbed deobf, and `run` reaches it.
+        Stage("deobf", "Phase 4", deobf_stage,
+              inputs=["bindings.json", "libs"], outputs=["deobf.json"],
+              summary="recover MBA / hidden constants (strings: use unseed)"),
         Stage("lift", "Phase 6", lift_stage,
               inputs=["trace.json", "bindings.json", "libs"], outputs=["jir"],
               summary="lift native idioms to JVM-level IR"),
-        # emit and verify consume lift/emit outputs directly (no dependence on the
-        # per-site deobf pass), so they run here before the still-stubbed deobf and
-        # `run` reaches them.
         Stage("emit", "Phase 7", emit_stage,
               inputs=["jir"], outputs=["rebuilt.jar"],
               summary="emit bytecode, rebuild the jar"),
@@ -79,10 +69,6 @@ def build_pipeline() -> Pipeline:
               inputs=["rebuilt.jar", "emit.json", "jir", "trace.json"],
               outputs=["verify.json"],
               summary="differential verification"),
-        Stage("deobf", "Phase 4",
-              _stub("deobf", "Phase 4", "needs per-site concrete evaluation (Phase 5a)"),
-              inputs=["bindings.json"], outputs=["deobf.json"],
-              summary="recover strings / MBA constants / call targets / flatten"),
     ]
     return Pipeline(stages)
 

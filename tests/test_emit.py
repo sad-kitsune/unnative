@@ -87,6 +87,43 @@ class WriterFillTests(JavaFixtureCase):
         _body, meta = out.code_of(keep)
         self.assertEqual(meta["max_locals"], 2)      # this + one int
 
+    # -- int constants (value_consts -> ldc) and spill slots (astore/aload) ---
+    def test_writer_encodes_int_ldc_and_spill_slots(self):
+        raw = _class_bytes(BOOM, self.tmp, "Boom")
+        w = ClassWriter(ClassFile("Boom.class", raw))
+        # aload_0 (instance receiver) + bipush 20 + sipush 300 reaches 3 locals.
+        w.set_method_code("keep", "(I)I", [
+            {"bc": "aload", "slot": 0},
+            {"bc": "astore", "slot": 1},
+            {"bc": "aload", "slot": 1},
+            {"bc": "ldc", "ctype": "I", "value": 20},
+            {"bc": "ldc", "ctype": "I", "value": 300},
+            {"bc": "ireturn"},
+        ])
+        out = ClassFile("Boom.class", w.to_bytes())
+        keep = next(m for m in out.methods if m["name"] == "keep")
+        body, meta = out.code_of(keep)
+        self.assertEqual([i.name for i in decode(body)],
+                         ["aload_0", "astore_1", "aload_1", "bipush", "sipush", "ireturn"])
+        self.assertEqual(meta["max_locals"], 2)     # this + spilled slot 1
+        # 20 -> bipush (0x10), 300 -> sipush (0x11): each small int, its own encoding.
+        self.assertIn(0x10, body)
+        self.assertIn(0x11, body)
+
+    def test_iconst_short_forms(self):
+        raw = _class_bytes(BOOM, self.tmp, "Boom")
+        w = ClassWriter(ClassFile("Boom.class", raw))
+        w.set_method_code("keep", "(I)I", [
+            {"bc": "ldc", "ctype": "I", "value": 1},
+            {"bc": "ldc", "ctype": "I", "value": -1},
+            {"bc": "ireturn"},
+        ])
+        out = ClassFile("Boom.class", w.to_bytes())
+        keep = next(m for m in out.methods if m["name"] == "keep")
+        body, _meta = out.code_of(keep)
+        self.assertEqual([i.name for i in decode(body)],
+                         ["iconst_1", "iconst_m1", "ireturn"])
+
 
 class WriterRefusalTests(JavaFixtureCase):
     def test_refuses_overwriting_real_code(self):
@@ -178,7 +215,39 @@ class EmitStageTests(JavaFixtureCase):
             emit_stage(wd)
 
 
+# System.out.println("Hi from unnative") — the broadened (non-throw) shape.
+PRINTLN = [
+    {"bc": "getstatic", "owner": "java/lang/System", "name": "out",
+     "desc": "Ljava/io/PrintStream;"},
+    {"bc": "ldc", "ctype": "String", "value": "Hi from unnative"},
+    {"bc": "invokevirtual", "owner": "java/io/PrintStream", "name": "println",
+     "desc": "(Ljava/lang/String;)V"},
+    {"bc": "return"},
+]
+GREETER = {"Greeter.java": """
+public class Greeter {
+    public static native void greet();
+    public static void main(String[] a) { greet(); }
+}
+"""}
+
+
 class JavaVerifyTests(JavaFixtureCase):
+    def test_filled_println_runs_on_jvm(self):
+        require("java")
+        classes = compile_java(GREETER, self.tmp)
+        path = os.path.join(classes, "Greeter.class")
+        with open(path, "rb") as f:
+            raw = f.read()
+        w = ClassWriter(ClassFile("Greeter.class", raw))
+        w.set_method_code("greet", "()V", PRINTLN)
+        with open(path, "wb") as f:
+            f.write(w.to_bytes())
+        proc = subprocess.run(["java", "-Xverify:all", "-cp", classes, "Greeter"],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "Hi from unnative")
+
     """The real proof: the JVM's own verifier accepts the filled method."""
 
     def test_filled_class_passes_xverify_all(self):
